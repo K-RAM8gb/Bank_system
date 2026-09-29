@@ -106,3 +106,11 @@ Fraud prevention relies on a combination of strict logic rules and AI perception
 3. **Stateless Image Storage:** Currently, images are stored locally in the `static/uploads/` directory. If the FastAPI server restarts in a containerized environment (like Docker or Heroku) without a mounted volume, the uploaded images will be lost.
 
 ---
+
+## 📦 Deliverables
+
+This repository contains all requirements for the Engineering Challenge:
+1. **Working Prototype:** Fully functional backend API and React dashboard.
+2. **Source Code:** Available in this repository.
+3. **README:** Setup instructions and architecture documented above.
+4. **Demonstration:** A demonstration video showcasing payment scenarios (Valid, Wrong Amount, Duplicate, Unclear) is included in the submission files.
