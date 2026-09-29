@@ -9,11 +9,27 @@ import imagehash
 import pytesseract
 from google import genai
 import json
+from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 
 app = FastAPI(title="Payment Verification API")
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # In production, restrict this to your frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+@app.get("/payments")
+def get_all_payments():
+    """Fetches all payment submissions for the business dashboard."""
+    # The syntax '*, orders(...)' performs a SQL JOIN in Supabase
+    response = supabase.table("payments").select(
+        "*, orders(customer_phone, expected_amount)"
+    ).order("created_at", desc=True).execute()
+    
+    return response.data
 url: str = os.environ.get("SUPABASE_URL", "")
 key: str = os.environ.get("SUPABASE_KEY", "")
 
