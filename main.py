@@ -55,32 +55,46 @@ def get_image_hash(image_bytes: bytes) -> str:
     return hashlib.sha256(image_bytes).hexdigest()
 
 def extract_payment_details(image_bytes: bytes) -> dict:
-    """Runs local OCR and uses regex to find amounts, references, accounts, and dates."""
+    """Runs local OCR and uses robust regex to find amounts, references, accounts, and dates."""
     img = Image.open(io.BytesIO(image_bytes))
     raw_text = pytesseract.image_to_string(img)
     
-    amount_matches = re.findall(r'(?:Rs\.?|LKR)?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)', raw_text)
-    ref_matches = re.findall(r'\b(\d{6})\b', raw_text)
-    
-    # Extract Account (Looks for "To Account: XXXX1234" or "A/C: 12345678")
-    acc_match = re.search(r'(?:Account|A/C|Acc)[\s:]*([A-Za-z0-9*X]+)', raw_text, re.IGNORECASE)
-    
-    # Extract Date (Looks for YYYY-MM-DD)
-    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', raw_text)
-    
+    # 1. AMOUNT: Looks for "Amount", "LKR", or "Rs" followed by the value
+    amount_matches = re.findall(r'(?:Amount|LKR|Rs\.?)[\s:]*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)', raw_text, re.IGNORECASE)
     amount = float(amount_matches[0].replace(',', '')) if amount_matches else None
-    reference = ref_matches[0] if ref_matches else None
-    account = acc_match.group(1) if acc_match else None
+    
+    # 2. REFERENCE: Handles "Reference Number:" explicitly 
+    ref_matches = re.findall(r'(?:Transaction ID|Ref(?:erence)?(?:\s*Number|\s*No\.?)?|Txn ID|Transaction reference)[\s:-]*([A-Za-z0-9/-]+)', raw_text, re.IGNORECASE)
+    valid_refs = [r.strip('-/') for r in ref_matches if any(char.isdigit() for char in r) and len(r) > 4]
+    reference = valid_refs[0] if valid_refs else None
+    
+    # 3. ACCOUNT: 
+    acc_matches_raw = re.findall(r'(?:Account(?: No| Number)?|A/C|To Account|To)[\s:]*([0-9*X]+(?:\s+[0-9*X]+)*)', raw_text, re.IGNORECASE)
+    acc_matches = [acc.replace(' ', '') for acc in acc_matches_raw]
+    
+    # Use negative lookarounds (?<!...) and (?!...) to ensure the number is NOT touching a slash or dash
+    standalone_accs = re.findall(r'(?<![/\-\.])\b(\d{9,16})\b(?![/\-\.])', raw_text)
+    
+    raw_accounts = acc_matches + standalone_accs
+    
+    # Filter out noise: Must be >3 chars AND must NOT be a part of the extracted reference
+    accounts = list(set([
+        acc for acc in raw_accounts 
+        if len(acc) > 3 and (reference is None or acc not in reference)
+    ]))
+    
+    # 4. DATE: Supports both DD-MM-YYYY and YYYY-MM-DD formats
+    date_match = re.search(r'(\d{2}[-/]\d{2}[-/]\d{4}|\d{4}[-/]\d{2}[-/]\d{2})', raw_text)
     date_str = date_match.group(1) if date_match else None
     
     return {
         "raw_text": raw_text,
         "amount": amount,
         "reference": reference,
-        "account": account,
+        "accounts": accounts,
         "date": date_str
     }
-
+      
 def analyze_slip_with_ai(image_bytes: bytes, expected_amount: float) -> dict:
     """Uses LLM Vision to extract data and detect fraud when standard OCR fails."""
     if not ai_client:
@@ -202,49 +216,51 @@ async def verify_payment(
         else:
             return finalize("REJECTED", "Duplicate submission for this order.", "We already received this exact slip and it is pending review. Please wait.")
 
-    # ---------------------------------------------------------
+# ---------------------------------------------------------
     # TIER 2: Basic OCR & DB Matching
     # ---------------------------------------------------------
-    EXPECTED_BUSINESS_ACCOUNT = "XXXX1234"
+    
+    # NOTE: To test a successful approval with your BOC slip, temporarily change this to "0002726227"
+    EXPECTED_BUSINESS_ACCOUNT = "XXXX1234" 
+    
     extracted_data = extract_payment_details(image_bytes)
     
     raw_text = extracted_data.get("raw_text", "").lower()
     ext_amount = extracted_data.get("amount")
     ext_ref = extracted_data.get("reference")
-    ext_account = extracted_data.get("account")
+    ext_accounts = extracted_data.get("accounts") # This is now a list
     ext_date = extracted_data.get("date")
 
     banking_keywords = ["bank", "transfer", "account", "a/c", "ref", "reference", "transaction", "success", "payment", "rs", "lkr"]
     has_keywords = any(word in raw_text for word in banking_keywords)
-    # NEW: Logical Duplicate Detection (Catches cropped/rotated reused slips)
-    if ext_ref:
-        ref_check = supabase.table("payments").select("order_id").eq("extracted_reference", ext_ref).eq("verification_status", "APPROVED").execute()
-        
-        # If this reference was already approved for a DIFFERENT order
-        if len(ref_check.data) > 0 and ref_check.data[0]['order_id'] != order_id:
-            return finalize(
-                "REJECTED", 
-                f"Reference {ext_ref} already used for an approved order.", 
-                "This transaction reference was already used for a different order. Please submit a genuine, unused slip."
-            )
     
     if not ext_amount and not ext_ref and not has_keywords:
-        return finalize(
-            "REJECTED", 
-            "Image does not appear to be a valid payment slip.", 
-            "The uploaded file does not look like a bank transfer slip. Please upload a valid payment receipt."
-        )
+        return finalize("REJECTED", "Image does not appear to be a valid payment slip.", "The uploaded file does not look like a bank transfer slip.")
 
-    if ext_account and ext_account != EXPECTED_BUSINESS_ACCOUNT:
-        return finalize("REJECTED", f"Incorrect account: {ext_account}. Expected: {EXPECTED_BUSINESS_ACCOUNT}", "This payment was made to an account that does not belong to the business.")
+    # 1. Check for Wrong Account (Checks if the business account is ANYWHERE in the extracted accounts)
+    ext_account = EXPECTED_BUSINESS_ACCOUNT if EXPECTED_BUSINESS_ACCOUNT in ext_accounts else (ext_accounts[-1] if ext_accounts else None)
+    
+    if ext_accounts and EXPECTED_BUSINESS_ACCOUNT not in ext_accounts:
+        return finalize("REJECTED", f"Incorrect account. Found: {ext_accounts}. Expected: {EXPECTED_BUSINESS_ACCOUNT}", "This payment was made to an account that does not belong to the business.")
 
+    # 2. Check for Old Payment (Handles multiple date formats)
     if ext_date:
-        try:
-            payment_date = datetime.strptime(ext_date, "%Y-%m-%d")
-            if (datetime.now() - payment_date).days > 7:
-                return finalize("REJECTED", f"Payment date ({ext_date}) is too old.", "This payment slip appears to be from a past transaction. Please submit a current slip.")
-        except ValueError:
-            pass
+        payment_date = None
+        for date_format in ("%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
+            try:
+                payment_date = datetime.strptime(ext_date, date_format)
+                break
+            except ValueError:
+                continue
+                
+        if payment_date and (datetime.now() - payment_date).days > 7:
+            return finalize("REJECTED", f"Payment date ({ext_date}) is too old.", "This payment slip appears to be from a past transaction. Please submit a current slip.")
+            
+    # NEW: Logical Duplicate Detection (Catches cropped/rotated reused slips via Reference ID)
+    if ext_ref:
+        ref_check = supabase.table("payments").select("order_id").eq("extracted_reference", ext_ref).eq("verification_status", "APPROVED").execute()
+        if len(ref_check.data) > 0 and ref_check.data[0]['order_id'] != order_id:
+            return finalize("REJECTED", f"Reference {ext_ref} already used.", "This transaction reference was already used for a different order. Please submit a genuine slip.")
 
     order_res = supabase.table("orders").select("*").eq("id", order_id).execute()
     if not order_res.data:
