@@ -9,7 +9,7 @@ export default function App() {
   // Poll the backend every 5 seconds so new uploads appear automatically
   useEffect(() => {
     const fetchPayments = () => {
-      fetch('http://127.0.0.1:8000/payments')
+      fetch('https://bank-system-l95x.onrender.com')
         .then(res => res.json())
         .then(data => {
           setPayments(data);
