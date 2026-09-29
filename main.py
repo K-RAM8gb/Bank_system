@@ -22,7 +22,7 @@ if not url or not key:
 
 supabase: Client = create_client(url, key)
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY", ""))
-VISION_MODEL_ID = 'gemini-2.5-flash'
+VISION_MODEL_ID = 'gemini-3.5-flash'
 
 def get_image_hash(image_bytes: bytes) -> str:
     """Generates a perceptual hash to detect duplicate or slightly cropped images."""
