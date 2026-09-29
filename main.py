@@ -14,6 +14,7 @@ import imagehash
 import pytesseract
 from google import genai
 from google.genai import types
+import hashlib
 
 
 load_dotenv()
@@ -50,9 +51,8 @@ ai_client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
 VISION_MODEL_ID = 'gemini-3.5-flash'
 
 def get_image_hash(image_bytes: bytes) -> str:
-    """Generates a perceptual hash to detect duplicate or slightly cropped images."""
-    img = Image.open(io.BytesIO(image_bytes))
-    return str(imagehash.phash(img))
+    """Generates a strict SHA-256 hash to detect exact file re-uploads."""
+    return hashlib.sha256(image_bytes).hexdigest()
 
 def extract_payment_details(image_bytes: bytes) -> dict:
     """Runs local OCR and uses regex to find amounts, references, accounts, and dates."""
@@ -183,16 +183,24 @@ async def verify_payment(
         }).execute()
         return {"status": final_status, "reason": final_reason, "next_action": final_action}
 
-    # ---------------------------------------------------------
-    # TIER 1: Duplicate Detection
+# ---------------------------------------------------------
+    # TIER 1: Exact Image Duplicate Detection
     # ---------------------------------------------------------
     duplicate_check = supabase.table("payments").select("*").eq("image_hash", img_hash).execute()
     if len(duplicate_check.data) > 0:
         prev_payment = duplicate_check.data[0]
+        prev_status = prev_payment['verification_status']
+        
         if prev_payment['order_id'] != order_id:
             return finalize("REJECTED", "Payment slip already used for a different order.", "This payment appears to have already been used for another order. Please send the correct slip.")
+        
+        # Smart responses based on previous submission status
+        if prev_status == "APPROVED":
+            return finalize("REJECTED", "Duplicate of an already approved slip.", "This payment was already verified and approved. No further action needed.")
+        elif prev_status == "REJECTED":
+            return finalize("REJECTED", "Duplicate of a rejected slip.", "You previously submitted this exact image and it was rejected. Please submit a DIFFERENT, valid payment slip.")
         else:
-            return finalize("REJECTED", "Duplicate submission for this order.", "We already received this slip. Please wait for verification.")
+            return finalize("REJECTED", "Duplicate submission for this order.", "We already received this exact slip and it is pending review. Please wait.")
 
     # ---------------------------------------------------------
     # TIER 2: Basic OCR & DB Matching
@@ -208,6 +216,17 @@ async def verify_payment(
 
     banking_keywords = ["bank", "transfer", "account", "a/c", "ref", "reference", "transaction", "success", "payment", "rs", "lkr"]
     has_keywords = any(word in raw_text for word in banking_keywords)
+    # NEW: Logical Duplicate Detection (Catches cropped/rotated reused slips)
+    if ext_ref:
+        ref_check = supabase.table("payments").select("order_id").eq("extracted_reference", ext_ref).eq("verification_status", "APPROVED").execute()
+        
+        # If this reference was already approved for a DIFFERENT order
+        if len(ref_check.data) > 0 and ref_check.data[0]['order_id'] != order_id:
+            return finalize(
+                "REJECTED", 
+                f"Reference {ext_ref} already used for an approved order.", 
+                "This transaction reference was already used for a different order. Please submit a genuine, unused slip."
+            )
     
     if not ext_amount and not ext_ref and not has_keywords:
         return finalize(
