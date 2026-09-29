@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from PIL import Image
 import imagehash
 import pytesseract
-import google.generativeai as genai
+from google import genai
 import json
 
 load_dotenv()
@@ -21,9 +21,8 @@ if not url or not key:
     raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in the .env file.")
 
 supabase: Client = create_client(url, key)
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
-# Using gemini-1.5-flash as it is the fastest and cheapest for simple vision tasks
-vision_model = genai.GenerativeModel('gemini-1.5-flash')
+client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY", ""))
+VISION_MODEL_ID = 'gemini-2.5-flash'
 
 def get_image_hash(image_bytes: bytes) -> str:
     """Generates a perceptual hash to detect duplicate or slightly cropped images."""
@@ -53,23 +52,35 @@ def analyze_slip_with_ai(image_bytes: bytes, expected_amount: float) -> dict:
     
     prompt = f"""
     Analyze this bank transfer slip. The expected amount is {expected_amount}.
-    Return ONLY a raw JSON object with no markdown formatting or backticks.
-    The JSON must have the following keys:
-    - "amount": (float) The exact amount transferred. If unreadable, return null.
-    - "reference": (string) The transaction reference number. If unreadable, return null.
-    - "is_manipulated": (boolean) True if the image looks edited, digitally altered, or suspicious.
-    - "confidence": (string) "high" or "low" based on image clarity.
-    - "reason": (string) A brief explanation of your findings.
+    It may be a digitally generated e-receipt, which is perfectly valid. Do not mark confidence as "low" just because it is digital.
+    Format your response EXACTLY matching this JSON schema:
+    {{
+        "amount": (float) The exact amount transferred. Use null if completely unreadable.,
+        "reference": (string) The reference number. Use null if completely unreadable.,
+        "is_manipulated": (boolean) True ONLY if you see clear signs of digital tampering like mismatched fonts or patches over numbers.,
+        "confidence": (string) "high" if you can read the text, "low" if it is too blurry or cut off.,
+        "reason": (string) A brief explanation of your findings.
+    }}
     """
     
     try:
-        response = vision_model.generate_content([prompt, img])
-        # Clean up any potential markdown formatting the LLM might add
-        raw_json = response.text.strip().removeprefix("```json").removesuffix("```").strip()
+        # Force strict JSON output from Gemini
+        response = client.models.generate_content(
+            model=VISION_MODEL_ID,
+            contents=[prompt, img],
+            config=genai.types.GenerateContentConfig(
+                response_mime_type="application/json",
+            )
+        )
+        
+        raw_json = response.text.strip()
+        print(f"\n[AI RESPONSE] {raw_json}\n") # Debugging print
         return json.loads(raw_json)
+        
     except Exception as e:
-        print(f"AI API Error: {e}")
-        return {"amount": None, "reference": None, "is_manipulated": False, "confidence": "low", "reason": "AI analysis failed."}
+        print(f"\n[AI ERROR] {e}\n")
+        return {"amount": None, "reference": None, "is_manipulated": False, "confidence": "low", "reason": f"AI Error: {str(e)}"}
+
 @app.get("/health")
 def health_check():
     return {"status": "System Online"}
@@ -105,7 +116,7 @@ async def verify_payment(
     extracted_data = extract_payment_details(image_bytes)
     ext_amount = extracted_data["amount"]
     ext_ref = extracted_data["reference"]
-
+    print(f"\n[OCR Extracted] Amount: {ext_amount}, Ref: {ext_ref}")
     order_res = supabase.table("orders").select("*").eq("id", order_id).execute()
     if not order_res.data:
         return {"status": "NEEDS_VERIFICATION", "reason": "Order not found.", "next_action": "Order error."}
