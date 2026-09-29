@@ -1,4 +1,5 @@
 import os
+import shutil
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -7,12 +8,21 @@ load_dotenv()
 supabase: Client = create_client(os.environ.get("SUPABASE_URL", ""), os.environ.get("SUPABASE_KEY", ""))
 
 def reset_and_seed():
-    print("Clearing old data...")
+    print("Clearing old data from database...")
     # Delete in reverse order of foreign keys
     supabase.table("payments").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
     supabase.table("orders").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
     supabase.table("sms_notifications").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
 
+    print("Clearing old uploaded images...")
+    upload_dir = "static/uploads"
+    if os.path.exists(upload_dir):
+        # Completely remove the directory and everything inside it
+        shutil.rmtree(upload_dir)
+        
+    # Recreate a fresh, empty directory
+    os.makedirs(upload_dir, exist_ok=True)
+        
     print("Seeding new test data...")
     
     # 1. Insert Orders

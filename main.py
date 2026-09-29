@@ -1,16 +1,20 @@
 import os
 import io
 import re
+import uuid
+import json
+from datetime import datetime, timedelta
 from fastapi import FastAPI, UploadFile, Form, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from PIL import Image
 import imagehash
 import pytesseract
 from google import genai
-import json
-from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime, timedelta 
+from google.genai import types
+
 
 load_dotenv()
 
@@ -22,6 +26,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+os.makedirs("static/uploads", exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="static/uploads"), name="uploads")
+
 @app.get("/payments")
 def get_all_payments():
     """Fetches all payment submissions for the business dashboard."""
@@ -38,7 +45,8 @@ if not url or not key:
     raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in the .env file.")
 
 supabase: Client = create_client(url, key)
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY", ""))
+gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
+ai_client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
 VISION_MODEL_ID = 'gemini-3.5-flash'
 
 def get_image_hash(image_bytes: bytes) -> str:
@@ -75,38 +83,65 @@ def extract_payment_details(image_bytes: bytes) -> dict:
 
 def analyze_slip_with_ai(image_bytes: bytes, expected_amount: float) -> dict:
     """Uses LLM Vision to extract data and detect fraud when standard OCR fails."""
+    if not ai_client:
+        return {"amount": None, "reference": None, "is_manipulated": False, "confidence": "low", "reason": "AI Client not configured."}
+
     img = Image.open(io.BytesIO(image_bytes))
     
     prompt = f"""
     Analyze this bank transfer slip. The expected amount is {expected_amount}.
-    It may be a digitally generated e-receipt, which is perfectly valid. Do not mark confidence as "low" just because it is digital.
-    Format your response EXACTLY matching this JSON schema:
+    Return ONLY a JSON object. 
+    Use this exact structure:
     {{
-        "amount": (float) The exact amount transferred. Use null if completely unreadable.,
-        "reference": (string) The reference number. Use null if completely unreadable.,
-        "is_manipulated": (boolean) True ONLY if you see clear signs of digital tampering like mismatched fonts or patches over numbers.,
-        "confidence": (string) "high" if you can read the text, "low" if it is too blurry or cut off.,
-        "reason": (string) A brief explanation of your findings.
+        "amount": 25000.00,
+        "reference": "839201",
+        "is_manipulated": false,
+        "confidence": "high",
+        "reason": "Clear image, extracted details."
     }}
+    If a value is unreadable, use null. 
+    CRITICAL: For "confidence", use "high" or "low" based ONLY on the visual clarity of the image. Do NOT set confidence to "low" just because the amount or account is wrong.
     """
     
+    print("\n" + "="*40)
+    print("🚀 SENDING DATA TO GEMINI AI (NEW SDK)")
+    print("="*40)
+    
     try:
-        # Force strict JSON output from Gemini
-        response = client.models.generate_content(
-            model=VISION_MODEL_ID,
+        # New SDK syntax for generating content
+        response = ai_client.models.generate_content(
+            model='gemini-1.5-flash',
             contents=[prompt, img],
-            config=genai.types.GenerateContentConfig(
-                response_mime_type="application/json",
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
             )
         )
         
-        raw_json = response.text.strip()
-        print(f"\n[AI RESPONSE] {raw_json}\n") # Debugging print
-        return json.loads(raw_json)
+        raw_text = response.text
         
+        print("\n" + "="*40)
+        print("✅ RAW RESPONSE FROM GEMINI AI")
+        print("="*40)
+        print(raw_text)
+        print("="*40 + "\n")
+        
+        # Robust fallback to extract JSON
+        json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        
+        if json_match:
+            return json.loads(json_match.group(0))
+        else:
+            return json.loads(raw_text)
+            
     except Exception as e:
-        print(f"\n[AI ERROR] {e}\n")
-        return {"amount": None, "reference": None, "is_manipulated": False, "confidence": "low", "reason": f"AI Error: {str(e)}"}
+        print(f"\n❌ AI API ERROR: {e}")
+        return {
+            "amount": None, 
+            "reference": None, 
+            "is_manipulated": False, 
+            "confidence": "low", 
+            "reason": f"AI analysis failed: {e}"
+        }
 
 @app.get("/health")
 def health_check():
@@ -119,152 +154,115 @@ async def verify_payment(
     payment_slip: UploadFile = File(...)
 ):
     image_bytes = await payment_slip.read()
-    img_hash = get_image_hash(image_bytes)
-
-    # 1. Verify Order Exists First
-    order_res = supabase.table("orders").select("*").eq("id", order_id).execute()
-    if not order_res.data:
-        return {"status": "NEEDS_VERIFICATION", "reason": "Order not found.", "next_action": "Order error."}
     
-    expected_amount = order_res.data[0]["expected_amount"]
-
-    def save_and_return(status, reason, next_action, ext_amt=None, ext_ref=None):
+    # 1. Save File Locally
+    filename = f"{uuid.uuid4()}.png"
+    filepath = os.path.join("static/uploads", filename)
+    with open(filepath, "wb") as f:
+        f.write(image_bytes)
+    
+    slip_image_url = f"http://127.0.0.1:8000/uploads/{filename}"
+    img_hash = get_image_hash(image_bytes)
+    
+    # Default variables for the database record
+    ext_amount, ext_ref, ext_account, ext_date = None, None, None, None
+    status, reason, next_action = "NEEDS_VERIFICATION", "System processing failed.", "Please wait for manual review."
+    
+    # Helper for exiting the pipeline and logging to DB
+    def finalize(final_status, final_reason, final_action):
         supabase.table("payments").insert({
             "order_id": order_id,
+            "slip_image_url": slip_image_url,
             "image_hash": img_hash,
-            "extracted_amount": ext_amt,
+            "extracted_amount": ext_amount,
             "extracted_reference": ext_ref,
-            "verification_status": status,
-            "reason": reason
+            "extracted_account": ext_account,
+            "extracted_date": ext_date,
+            "verification_status": final_status,
+            "reason": final_reason
         }).execute()
-        return {
-            "status": status,
-            "reason": reason,
-            "next_action": next_action
-        }
-    
+        return {"status": final_status, "reason": final_reason, "next_action": final_action}
+
+    # ---------------------------------------------------------
     # TIER 1: Duplicate Detection
+    # ---------------------------------------------------------
     duplicate_check = supabase.table("payments").select("*").eq("image_hash", img_hash).execute()
-    
     if len(duplicate_check.data) > 0:
         prev_payment = duplicate_check.data[0]
         if prev_payment['order_id'] != order_id:
-            return save_and_return(
-                "REJECTED", 
-                "This payment slip was already used for a different order.", 
-                "This payment appears to have already been used for another order. Please send the correct payment slip."
-            )
+            return finalize("REJECTED", "Payment slip already used for a different order.", "This payment appears to have already been used for another order. Please send the correct slip.")
         else:
-            return save_and_return(
-                "REJECTED", 
-                "Duplicate submission of the same payment slip for this order.", 
-                "We already received this slip. Please wait for verification."
-            )
+            return finalize("REJECTED", "Duplicate submission for this order.", "We already received this slip. Please wait for verification.")
 
+    # ---------------------------------------------------------
     # TIER 2: Basic OCR & DB Matching
+    # ---------------------------------------------------------
     EXPECTED_BUSINESS_ACCOUNT = "XXXX1234"
-    
     extracted_data = extract_payment_details(image_bytes)
-    ext_amount = extracted_data["amount"]
-    ext_ref = extracted_data["reference"]
-    ext_account = extracted_data["account"]
-    ext_date = extracted_data["date"]
+    
+    raw_text = extracted_data.get("raw_text", "").lower()
+    ext_amount = extracted_data.get("amount")
+    ext_ref = extracted_data.get("reference")
+    ext_account = extracted_data.get("account")
+    ext_date = extracted_data.get("date")
 
-    # 1. Check for Wrong Account
-    if ext_account and ext_account != EXPECTED_BUSINESS_ACCOUNT:
-        return save_and_return(
+    banking_keywords = ["bank", "transfer", "account", "a/c", "ref", "reference", "transaction", "success", "payment", "rs", "lkr"]
+    has_keywords = any(word in raw_text for word in banking_keywords)
+    
+    if not ext_amount and not ext_ref and not has_keywords:
+        return finalize(
             "REJECTED", 
-            f"Payment made to incorrect account: {ext_account}. Expected: {EXPECTED_BUSINESS_ACCOUNT}", 
-            "This payment was made to an account that does not belong to the business. Please check the details.",
-            ext_amount, ext_ref
+            "Image does not appear to be a valid payment slip.", 
+            "The uploaded file does not look like a bank transfer slip. Please upload a valid payment receipt."
         )
 
-    # 2. Check for Old Payment (e.g., older than 7 days)
+    if ext_account and ext_account != EXPECTED_BUSINESS_ACCOUNT:
+        return finalize("REJECTED", f"Incorrect account: {ext_account}. Expected: {EXPECTED_BUSINESS_ACCOUNT}", "This payment was made to an account that does not belong to the business.")
+
     if ext_date:
         try:
             payment_date = datetime.strptime(ext_date, "%Y-%m-%d")
-            # If the payment date is more than 7 days old
             if (datetime.now() - payment_date).days > 7:
-                return save_and_return(
-                    "REJECTED", 
-                    f"Payment date ({ext_date}) is too old to be for this current order.", 
-                    "This payment slip appears to be from a past transaction. Please submit the slip for your new order.",
-                    ext_amount, ext_ref
-                )
+                return finalize("REJECTED", f"Payment date ({ext_date}) is too old.", "This payment slip appears to be from a past transaction. Please submit a current slip.")
         except ValueError:
-            pass # Ignore date parsing errors and let AI handle it if necessary
+            pass
 
-    # 3. Compare Amounts
+    order_res = supabase.table("orders").select("*").eq("id", order_id).execute()
+    if not order_res.data:
+        return finalize("NEEDS_VERIFICATION", "Order not found in system.", "Order error.")
+    
+    expected_amount = order_res.data[0]["expected_amount"]
+
     if ext_amount and float(ext_amount) != float(expected_amount):
-        return save_and_return(
-            "NEEDS_VERIFICATION", 
-            f"Amount mismatch. Expected {expected_amount}, Found {ext_amount}.",
-            "The payment amount does not match your order. Please check the payment and send the correct slip.",
-            ext_amount, ext_ref
-        )
+        return finalize("NEEDS_VERIFICATION", f"Amount mismatch. Expected {expected_amount}, Found {ext_amount}.", "The payment amount does not match your order. Please check the payment.")
 
-    # 4. Look for matching Bank SMS Evidence
     if ext_ref:
         sms_check = supabase.table("sms_notifications").select("*").eq("extracted_reference", ext_ref).execute()
         if len(sms_check.data) > 0:
             sms_data = sms_check.data[0]
             if float(sms_data["extracted_amount"]) == float(expected_amount):
-                # Perfect 3-Way Match!
-                return save_and_return(
-                    "APPROVED", 
-                    "Perfect match with order and bank SMS.", 
-                    "Payment accepted! Your order is confirmed.",
-                    ext_amount, ext_ref
-                )
+                return finalize("APPROVED", "Perfect match with order and bank SMS.", "Payment accepted! Your order is confirmed.")
 
-    #--------------------------------------------------------
-    # TIER 3: AI Fallback (Cost: Low API usage)
+    # ---------------------------------------------------------
+    # TIER 3: AI Fallback
     # ---------------------------------------------------------
     ai_result = analyze_slip_with_ai(image_bytes, expected_amount)
     
-    ai_amount = ai_result.get("amount")
-    ai_ref = ai_result.get("reference")
-
-    # Check for Fraud/Manipulation first
     if ai_result.get("is_manipulated"):
-        return save_and_return(
-            "REJECTED", 
-            "AI detected potential image manipulation or suspicious formatting.", 
-            "Your payment slip appears invalid or altered. Please provide a genuine, unedited bank slip.",
-            ai_amount, ai_ref
-        )
+        return finalize("REJECTED", "AI detected potential image manipulation.", "Your payment slip appears invalid or altered. Please provide a genuine, unedited bank slip.")
         
-    # Check AI extracted amount
+    ai_amount = ai_result.get("amount")
+    if ai_amount:
+        ext_amount = ai_amount  # Update database record with AI findings
+        
     if ai_amount and float(ai_amount) != float(expected_amount):
-        return save_and_return(
-            "NEEDS_VERIFICATION", 
-            f"AI extracted amount {ai_amount} does not match expected {expected_amount}.", 
-            "The payment amount does not match your order. Please check the payment and send the correct slip.",
-            ai_amount, ai_ref
-        )
+        return finalize("NEEDS_VERIFICATION", f"AI extracted amount {ai_amount} does not match expected {expected_amount}.", "The payment amount does not match your order.")
         
-    # If AI has low confidence (blurry, dark, cropped)
     if ai_result.get("confidence") == "low":
-        return save_and_return(
-            "NEEDS_VERIFICATION", 
-            "Image is too unclear for AI to confidently verify.", 
-            "We couldn't clearly read the payment slip. Please send a clearer image of the complete slip.",
-            ai_amount, ai_ref
-        )
+        return finalize("NEEDS_VERIFICATION", "Image is too unclear for AI to confidently verify.", "We couldn't clearly read the payment slip. Please send a clearer image.")
         
-    # If AI verified the amount, but we still don't have matching bank SMS
     if ai_amount and float(ai_amount) == float(expected_amount):
-        return save_and_return(
-            "NEEDS_VERIFICATION", 
-            "AI verified amount, but no matching bank SMS found.", 
-            "The payment appears valid, but the transaction cannot currently be matched with a bank notification. Please wait.",
-            ai_amount, ai_ref
-        )
+        ext_ref = ai_result.get("reference")
+        return finalize("NEEDS_VERIFICATION", "AI verified amount, but no matching bank SMS found.", "The payment appears valid, but cannot currently be matched with a bank notification. Please wait.")
 
-    # Final Catch-All
-    return save_and_return(
-        "NEEDS_VERIFICATION", 
-        "System could not establish payment validity.", 
-        "Please hold while we manually review your payment.",
-        ai_amount, ai_ref
-    )
+    return finalize("NEEDS_VERIFICATION", "System could not establish payment validity.", "Please hold while we manually review your payment.")
