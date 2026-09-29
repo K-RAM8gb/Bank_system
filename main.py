@@ -1,7 +1,7 @@
 import os
 import io
 import re
-from fastapi import FastAPI, UploadFile, Form
+from fastapi import FastAPI, UploadFile, Form, File
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from PIL import Image
@@ -78,7 +78,7 @@ def health_check():
 async def verify_payment(
     order_id: str = Form(...),
     customer_phone: str = Form(...),
-    payment_slip: UploadFile = Form(...)
+    payment_slip: UploadFile = File(...)
 ):
     image_bytes = await payment_slip.read()
     
