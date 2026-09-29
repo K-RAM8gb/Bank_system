@@ -13,7 +13,10 @@ export default function App() {
         setPayments(data);
         setLoading(false);
       })
-      .catch(err => console.error("Error fetching payments:", err));
+      .catch(err => {
+        console.error("Error fetching payments:", err);
+        setLoading(false);
+      });
   }, []);
 
   const getStatusConfig = (status) => {
