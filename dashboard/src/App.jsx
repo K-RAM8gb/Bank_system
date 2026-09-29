@@ -9,7 +9,7 @@ export default function App() {
   // Poll the backend every 5 seconds so new uploads appear automatically
   useEffect(() => {
     const fetchPayments = () => {
-      fetch('http://127.0.0.1:8000/payments')
+      fetch('https://bank-system-l95x.onrender.com')
         .then(res => res.json())
         .then(data => {
           setPayments(data);
@@ -135,8 +135,8 @@ export default function App() {
                       </div>
 
                       <div className={`flex justify-between items-center p-2 rounded border mt-2 ${payment.extracted_amount !== payment.orders?.expected_amount
-                          ? 'bg-red-50 border-red-100'
-                          : 'bg-green-50 border-green-100'
+                        ? 'bg-red-50 border-red-100'
+                        : 'bg-green-50 border-green-100'
                         }`}>
                         <span className="text-gray-600 font-medium">Extracted Amount:</span>
                         <span className={`font-bold text-lg ${payment.extracted_amount !== payment.orders?.expected_amount ? 'text-red-700' : 'text-green-700'
